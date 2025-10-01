@@ -22,11 +22,14 @@ from metagpt.utils.token_counter import BEDROCK_TOKEN_COSTS
 class BedrockLLM(BaseLLM):
     def __init__(self, config: LLMConfig):
         self.config = config
+        self.model = config.model
         self.__client = self.__init_client("bedrock-runtime")
-        self.__provider = get_provider(self.config.model)
+        self.__provider = get_provider(
+            self.model, reasoning=self.config.reasoning, reasoning_max_token=self.config.reasoning_max_token
+        )
         self.cost_manager = CostManager(token_costs=BEDROCK_TOKEN_COSTS)
-        if self.config.model in NOT_SUPPORT_STREAM_MODELS:
-            logger.warning(f"model {self.config.model} doesn't support streaming output!")
+        if self.model in NOT_SUPPORT_STREAM_MODELS:
+            logger.warning(f"model {self.model} doesn't support streaming output!")
 
     def __init_client(self, service_name: Literal["bedrock-runtime", "bedrock"]):
         """initialize boto3 client"""
@@ -70,25 +73,25 @@ class BedrockLLM(BaseLLM):
     async def invoke_model(self, request_body: str) -> dict:
         loop = asyncio.get_running_loop()
         response = await loop.run_in_executor(
-            None, partial(self.client.invoke_model, modelId=self.config.model, body=request_body)
+            None, partial(self.client.invoke_model, modelId=self.model, body=request_body)
         )
         usage = self._get_usage(response)
-        self._update_costs(usage, self.config.model)
+        self._update_costs(usage, self.model)
         response_body = self._get_response_body(response)
         return response_body
 
     async def invoke_model_with_response_stream(self, request_body: str) -> EventStream:
         loop = asyncio.get_running_loop()
         response = await loop.run_in_executor(
-            None, partial(self.client.invoke_model_with_response_stream, modelId=self.config.model, body=request_body)
+            None, partial(self.client.invoke_model_with_response_stream, modelId=self.model, body=request_body)
         )
         usage = self._get_usage(response)
-        self._update_costs(usage, self.config.model)
+        self._update_costs(usage, self.model)
         return response
 
     @property
     def _const_kwargs(self) -> dict:
-        model_max_tokens = get_max_tokens(self.config.model)
+        model_max_tokens = get_max_tokens(self.model)
         if self.config.max_token > model_max_tokens:
             max_tokens = model_max_tokens
         else:
@@ -102,7 +105,11 @@ class BedrockLLM(BaseLLM):
     # However,aioboto3 doesn't support invoke model
 
     def get_choice_text(self, rsp: dict) -> str:
-        return self.__provider.get_choice_text(rsp)
+        rsp = self.__provider.get_choice_text(rsp)
+        if isinstance(rsp, dict):
+            self.reasoning_content = rsp.get("reasoning_content")
+            rsp = rsp.get("content")
+        return rsp
 
     async def acompletion(self, messages: list[dict]) -> dict:
         request_body = self.__provider.get_request_body(messages, self._const_kwargs)
@@ -113,7 +120,7 @@ class BedrockLLM(BaseLLM):
         return await self.acompletion(messages)
 
     async def _achat_completion_stream(self, messages: list[dict], timeout=USE_CONFIG_TIMEOUT) -> str:
-        if self.config.model in NOT_SUPPORT_STREAM_MODELS:
+        if self.model in NOT_SUPPORT_STREAM_MODELS:
             rsp = await self.acompletion(messages)
             full_text = self.get_choice_text(rsp)
             log_llm_stream(full_text)
@@ -124,6 +131,9 @@ class BedrockLLM(BaseLLM):
         collected_content = await self._get_stream_response_body(stream_response)
         log_llm_stream("\n")
         full_text = ("".join(collected_content)).lstrip()
+        if self.__provider.usage:
+            # if provider provide usage, update it
+            self._update_costs(self.__provider.usage, self.model)
         return full_text
 
     def _get_response_body(self, response) -> dict:
@@ -133,10 +143,16 @@ class BedrockLLM(BaseLLM):
     async def _get_stream_response_body(self, stream_response) -> List[str]:
         def collect_content() -> str:
             collected_content = []
+            collected_reasoning_content = []
             for event in stream_response["body"]:
-                chunk_text = self.__provider.get_choice_text_from_stream(event)
-                collected_content.append(chunk_text)
-                log_llm_stream(chunk_text)
+                reasoning, chunk_text = self.__provider.get_choice_text_from_stream(event)
+                if reasoning:
+                    collected_reasoning_content.append(chunk_text)
+                else:
+                    collected_content.append(chunk_text)
+                    log_llm_stream(chunk_text)
+            if collected_reasoning_content:
+                self.reasoning_content = "".join(collected_reasoning_content)
             return collected_content
 
         loop = asyncio.get_running_loop()

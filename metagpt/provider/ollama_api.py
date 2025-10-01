@@ -193,8 +193,9 @@ class OllamaLLM(BaseLLM):
     """
 
     def __init__(self, config: LLMConfig):
-        self.client = GeneralAPIRequestor(base_url=config.base_url)
+        self.client = GeneralAPIRequestor(base_url=config.base_url, key=config.api_key)
         self.config = config
+        self.model = config.model
         self.http_method = "post"
         self.use_system_prompt = False
         self.cost_manager = TokenCostManager()
